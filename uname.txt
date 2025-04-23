@@ -1,0 +1,331 @@
+const { Worker, isMainThread, workerData } = require('worker_threads');
+const { EventEmitter } = require('events');
+const { program } = require('commander');
+
+class ThreadGroup extends EventEmitter {
+  constructor(config) {
+    super();
+    this.config = {
+      name: 'Thread Group',
+      threads: 10,
+      iterations: 1,
+      rampUp: 60, // 秒
+      delay: 0,   // 启动延迟
+      duration: -1, // 持续时间
+      ...config
+    };
+    this.workers = [];
+    this.stats = {
+      started: 0,
+      completed: 0,
+      errors: 0
+    };
+  }
+
+  async start() {
+    await this.applyStartupDelay();
+    await this.rampUpThreads();
+    
+    if (this.config.duration > 0) {
+      setTimeout(() => this.stop(), this.config.duration * 1000);
+    }
+  }
+
+  async applyStartupDelay() {
+    if (this.config.delay > 0) {
+      await new Promise(resolve => 
+        setTimeout(resolve, this.config.delay * 1000));
+    }
+  }
+
+  async rampUpThreads() {
+    const interval = this.config.rampUp / this.config.threads * 1000;
+    
+    for (let i = 0; i < this.config.threads; i++) {
+      await new Promise(resolve => setTimeout(resolve, interval));
+      this.startWorker();
+    }
+  }
+
+  startWorker() {
+    const worker = new Worker(__filename, {
+      workerData: {
+        type: 'worker',
+        iterations: this.config.iterations,
+        task: this.config.task
+      }
+    });
+
+    worker.on('message', (msg) => {
+      this.stats[msg.type]++; // 统计完成/错误数
+      this.emit('data', msg);
+    });
+
+    this.workers.push(worker);
+  }
+
+  async stop() {
+    await Promise.all(
+      this.workers.map(worker => worker.terminate())
+    );
+    this.emit('end');
+  }
+}
+
+// 测试任务示例
+class SampleTask {
+  async execute(iteration) {
+    try {
+      const start = Date.now();
+      // 执行实际测试逻辑
+      await axios.get('http://api.example.com');
+      return {
+        success: true,
+        duration: Date.now() - start,
+        iteration
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error.message,
+        iteration
+      };
+    }
+  }
+}
+
+// 主程序
+if (isMainThread) {
+  program
+    .option('-t, --threads <number>', '线程数', 10)
+    .option('-r, --rampup <seconds>', '启动时间', 60)
+    .parse(process.argv);
+
+  // 创建线程组
+  const threadGroup = new ThreadGroup({
+    threads: program.opts().threads,
+    rampUp: program.opts().rampup,
+    task: new SampleTask()
+  });
+
+  threadGroup.on('data', (result) => {
+    console.log(`[${result.success ? '✓' : '✗'}] Iteration ${result.iteration}`);
+  });
+
+  threadGroup.start();
+} else if (workerData.type === 'worker') {
+  // 工作线程执行逻辑
+  (async () => {
+    for (let i = 0; i < workerData.iterations; i++) {
+      const result = await workerData.task.execute(i);
+      process.send({
+        type: result.success ? 'completed' : 'errors',
+        ...result
+      });
+      
+      if (workerData.iterations === 'infinite') {
+        i--; // 无限循环
+      }
+    }
+  })();
+}
+
+
+class Scheduler {
+  static create(type, options) {
+    switch(type) {
+      case 'fixed-rate':
+        return new FixedRateScheduler(options);
+      case 'random-delay':
+        return new RandomDelayScheduler(options);
+      case 'throughput':
+        return new ThroughputScheduler(options);
+    }
+  }
+}
+
+class FixedRateScheduler {
+  constructor({ interval }) {
+    this.interval = interval;
+  }
+
+  async wait() {
+    await new Promise(resolve => 
+      setTimeout(resolve, this.interval));
+  }
+}
+
+// 在Worker中使用
+const scheduler = Scheduler.create('fixed-rate', { interval: 1000 });
+await scheduler.wait();
+
+class LoopController {
+  constructor({ count, forever }) {
+    this.count = count;
+    this.forever = forever;
+  }
+
+  shouldContinue(iteration) {
+    return this.forever || iteration < this.count;
+  }
+}
+
+// 使用示例
+const loop = new LoopController({ count: 10 });
+while(loop.shouldContinue(currentIteration)) {
+  // 执行测试逻辑
+}
+
+class ParameterizedThreadGroup extends ThreadGroup {
+  constructor(config) {
+    super(config);
+    this.data = this.loadTestData(config.dataSource);
+  }
+
+  loadTestData(source) {
+    // 从CSV/JSON加载测试数据
+    return require(source);
+  }
+
+  startWorker() {
+    const workerData = {
+      ...this.config,
+      data: this.data[this.stats.started % this.data.length]
+    };
+    const worker = new Worker(__filename, { workerData });
+    // ...其余逻辑
+  }
+}
+
+class StepLoadGenerator {
+  async generate(threadGroup) {
+    const steps = [
+      { threads: 100, duration: 60 },  // 第一阶段
+      { threads: 200, duration: 120 }, // 第二阶段
+      { threads: 300, duration: 180 }  // 第三阶段
+    ];
+
+    for (const step of steps) {
+      threadGroup.config.threads = step.threads;
+      await threadGroup.start();
+      await new Promise(resolve => 
+        setTimeout(resolve, step.duration * 1000));
+      await threadGroup.stop();
+    }
+  }
+}
+
+class TestPlan {
+  constructor() {
+    this.groups = [];
+  }
+
+  addGroup(group) {
+    this.groups.push(group);
+  }
+
+  async execute() {
+    // 顺序执行线程组
+    for (const group of this.groups) {
+      await group.start();
+      await group.completed;
+    }
+    
+    // 或并行执行
+    // await Promise.all(this.groups.map(g => g.start()));
+  }
+}
+
+// 使用示例
+const plan = new TestPlan();
+plan.addGroup(new ThreadGroup({ /* 登录线程组 */ }));
+plan.addGroup(new ThreadGroup({ /* 浏览商品线程组 */ }));
+plan.execute();
+
+class ResourceMonitor {
+  constructor(interval = 1000) {
+    this.metrics = {
+      cpu: [],
+      memory: [],
+      network: []
+    };
+    
+    setInterval(() => this.recordMetrics(), interval);
+  }
+
+  recordMetrics() {
+    const cpuUsage = process.cpuUsage();
+    const memory = process.memoryUsage();
+    this.metrics.cpu.push(cpuUsage.user);
+    this.metrics.memory.push(memory.heapUsed);
+  }
+
+  getReport() {
+    return {
+      cpuAvg: average(this.metrics.cpu),
+      memoryMax: Math.max(...this.metrics.memory)
+    };
+  }
+}
+
+// 集成到线程组
+threadGroup.on('data', () => monitor.record());
+
+{
+  "testPlan": {
+    "groups": [
+      {
+        "name": "登录用户组",
+        "threads": 50,
+        "iterations": 10,
+        "rampUp": 30,
+        "scenario": {
+          "type": "sequence",
+          "steps": [
+            {"action": "login", "method": "POST"},
+            {"action": "queryProfile", "method": "GET"}
+          ]
+        }
+      },
+      {
+        "name": "访客浏览组",
+        "threads": 100,
+        "duration": 300,
+        "scenario": {
+          "type": "random",
+          "actions": ["viewHome", "searchProduct", "viewDetail"]
+        }
+      }
+    ]
+  }
+}
+
+const http = require('http');
+const keepAliveAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 100, // 每个线程最大连接数
+  timeout: 60000
+});
+
+axios.defaults.httpAgent = keepAliveAgent;
+
+// 定期清理统计数据
+setInterval(() => {
+  this.stats = this.calculateSummary();
+  this.detailedStats = [];
+}, 5000);
+
+
+class StatsAggregator {
+  constructor() {
+    this.counters = new Map();
+  }
+
+  increment(key, value = 1) {
+    this.counters.set(key, (this.counters.get(key) || 0) + value);
+  }
+
+  getSummary() {
+    return Object.fromEntries(this.counters);
+  }
+}
